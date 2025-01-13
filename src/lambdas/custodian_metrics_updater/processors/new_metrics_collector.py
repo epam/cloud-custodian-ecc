@@ -5,7 +5,8 @@ from modular_sdk.models.customer import Customer
 from modular_sdk.models.tenant import Tenant
 from modular_sdk.modular import Modular
 
-from helpers.constants import Cloud, JobState, ReportType
+from helpers import json_round_trip
+from helpers.constants import GLOBAL_REGION, Cloud, JobState, ReportType
 from helpers.log_helper import get_logger
 from helpers.time_helper import utc_datetime
 from models.metrics import ReportMetrics
@@ -15,6 +16,7 @@ from services.ambiguous_job_service import AmbiguousJobService
 from services.license_service import License, LicenseService
 from services.metadata import Metadata
 from services.report_service import ReportService
+from services.platform_service import PlatformService, Platform
 from services.reports import (
     JobMetricsDataSource,
     ReportMetricsService,
@@ -136,6 +138,8 @@ class MetricsCollector:
     LARGE_REPORTS = (
         ReportType.OPERATIONAL_RULES,
         ReportType.OPERATIONAL_RESOURCES,
+        ReportType.OPERATIONAL_ATTACKS,
+        ReportType.OPERATIONAL_KUBERNETES
     )
 
     def __init__(
@@ -146,6 +150,8 @@ class MetricsCollector:
         report_metrics_service: ReportMetricsService,
         license_service: LicenseService,
         ruleset_service: RulesetService,
+        platform_service: PlatformService
+
     ):
         self._mc = modular_client
         self._ajs = ambiguous_job_service
@@ -153,8 +159,10 @@ class MetricsCollector:
         self._rms = report_metrics_service
         self._ls = license_service
         self._rss = ruleset_service
+        self._ps = platform_service
 
         self._tenants_cache = {}
+        self._platforms_cache = {}
 
     @classmethod
     def build(cls) -> 'MetricsCollector':
@@ -165,6 +173,7 @@ class MetricsCollector:
             report_metrics_service=SP.report_metrics_service,
             license_service=SP.license_service,
             ruleset_service=SP.ruleset_service,
+            platform_service=SP.platform_service
         )
 
     @staticmethod
@@ -216,6 +225,16 @@ class MetricsCollector:
         self._tenants_cache[name] = item
         return item
 
+    def _get_platform(self, platform_id: str) -> Platform | None:
+        if platform_id in self._platforms_cache:
+            return self._platforms_cache[platform_id]
+        platform = self._ps.get_nullable(platform_id)
+        if not platform:
+            return
+        self._ps.fetch_application(platform)
+        self._platforms_cache[platform_id] = platform
+        return platform
+
     def save_data_to_s3(self, it: ReportsGen) -> ReportsGen:
         for item in it:
             if item.type in self.LARGE_REPORTS:
@@ -243,16 +262,20 @@ class MetricsCollector:
         some sources of data and use lower-level metrics to calculate higher
         level
         """
-        reports = (
+        # NOTE: these are reports that need jobs, and thus we should consider
+        # the reporting period for each one (yes, currently all reports
+        # are specified)
+        start, end = self.whole_period(
+            ctx.now,
             ReportType.OPERATIONAL_OVERVIEW,
             ReportType.OPERATIONAL_RESOURCES,
             ReportType.OPERATIONAL_RULES,
             ReportType.OPERATIONAL_FINOPS,
+            ReportType.OPERATIONAL_ATTACKS,
+            ReportType.OPERATIONAL_KUBERNETES,
             ReportType.C_LEVEL_OVERVIEW,
         )
-
-        start, end = self.whole_period(ctx.now, *reports)
-        _LOG.info(f'Need to collect data from {start} to {end}')
+        _LOG.info(f'Need to collect jobs data from {start} to {end}')
         jobs = self._ajs.to_ambiguous(
             self._ajs.get_by_customer_name(
                 customer_name=ctx.customer.name,
@@ -311,8 +334,38 @@ class MetricsCollector:
                 report_type=ReportType.OPERATIONAL_FINOPS,
             )
         )
+        _LOG.info('Generating operational compliance for all tenants')
+        ctx.add_reports(
+            self.operational_compliance(
+                ctx=ctx,
+                job_source=job_source,
+                sc_provider=sc_provider,
+                report_type=ReportType.OPERATIONAL_COMPLIANCE,
+            )
+        )
+        _LOG.info('Generating operational attacks for all tenants')
+        ctx.add_reports(
+            self.save_data_to_s3(
+                self.operational_attacks(
+                    ctx=ctx,
+                    job_source=job_source,
+                    sc_provider=sc_provider,
+                    report_type=ReportType.OPERATIONAL_ATTACKS,
+                )
+            )
+        )
+        _LOG.info('Generating operational k8s report for all platforms')
+        ctx.add_reports(
+            self.save_data_to_s3(
+                self.operational_k8s(
+                    ctx=ctx,
+                    job_source=job_source,
+                    sc_provider=sc_provider,
+                    report_type=ReportType.OPERATIONAL_KUBERNETES
+                )
+            )
+        )
 
-        # todo operational compliance, attacks, finops, kubernetes
         # todo project reports
         # todo tops
         # todo clevel
@@ -350,7 +403,7 @@ class MetricsCollector:
     ) -> ReportsGen:
         start = report_type.start(ctx.now)
         end = report_type.end(ctx.now)
-        js = job_source.subset(start=start, end=end)
+        js = job_source.subset(start=start, end=end, affiliation='tenant')
         # TODO: maybe collect for all tenants
         for tenant_name in js.scanned_tenants:
             tenant = self._get_tenant(tenant_name)
@@ -366,10 +419,12 @@ class MetricsCollector:
                 continue
             tjs = js.subset(tenant=tenant.name)
             sdc = ShardsCollectionDataSource(col, ctx.metadata)
+            # NOTE: ignoring jobs that are not finished
+            succeeded, failed = tjs.n_succeeded, tjs.n_failed
             data = {
-                'total_scans': len(tjs),
-                'failed_scans': tjs.n_failed,
-                'succeeded_scans': tjs.n_succeeded,
+                'total_scans': succeeded + failed,
+                'failed_scans': failed,
+                'succeeded_scans': succeeded,
                 'activated_regions': sorted(
                     modular_helpers.get_tenant_regions(tenant)
                 ),
@@ -399,7 +454,7 @@ class MetricsCollector:
         #  for a bigger period of time
         start = report_type.start(ctx.now)
         end = report_type.end(ctx.now)
-        js = job_source.subset(start=start, end=end)
+        js = job_source.subset(start=start, end=end, affiliation='tenant')
         for tenant_name in js.scanned_tenants:
             tenant = self._get_tenant(tenant_name)
             if not tenant:
@@ -414,9 +469,9 @@ class MetricsCollector:
                 continue
             data = {
                 'id': tenant.project,
-                'data': ShardsCollectionDataSource(
-                    col, ctx.metadata
-                ).resources(),
+                'data': json_round_trip(
+                    ShardsCollectionDataSource(col, ctx.metadata).resources()
+                ),
                 'last_scan_date': js.subset(tenant=tenant.name).last_scan_date,
                 'activated_regions': sorted(
                     modular_helpers.get_tenant_regions(tenant)
@@ -437,7 +492,7 @@ class MetricsCollector:
     ) -> ReportsGen:
         start = report_type.start(now)
         end = report_type.end(now)
-        js = job_source.subset(start=start, end=end)
+        js = job_source.subset(start=start, end=end, affiliation='tenant')
         for tenant_name in js.scanned_tenants:
             tenant = self._get_tenant(tenant_name)
             if not tenant:
@@ -474,7 +529,7 @@ class MetricsCollector:
     ) -> ReportsGen:
         start = report_type.start(ctx.now)
         end = report_type.end(ctx.now)
-        js = job_source.subset(start=start, end=end)
+        js = job_source.subset(start=start, end=end, affiliation='tenant')
         for tenant_name in js.scanned_tenants:
             tenant = self._get_tenant(tenant_name)
             if not tenant:
@@ -489,7 +544,9 @@ class MetricsCollector:
                 continue
             data = {
                 'id': tenant.project,
-                'data': ShardsCollectionDataSource(col, ctx.metadata).finops(),
+                'data': json_round_trip(
+                    ShardsCollectionDataSource(col, ctx.metadata).finops()
+                ),
                 'last_scan_date': js.subset(tenant=tenant.name).last_scan_date,
                 'activated_regions': sorted(
                     modular_helpers.get_tenant_regions(tenant)
@@ -502,6 +559,139 @@ class MetricsCollector:
                 start=start,
             )
 
+    def operational_compliance(
+        self,
+        ctx: MetricsContext,
+        job_source: JobMetricsDataSource,
+        sc_provider: ShardsCollectionProvider,
+        report_type: ReportType,
+    ) -> ReportsGen:
+        start = report_type.start(ctx.now)
+        end = report_type.end(ctx.now)
+        js = job_source.subset(start=start, end=end, affiliation='tenant')
+        for tenant_name in js.scanned_tenants:
+            tenant = self._get_tenant(tenant_name)
+            if not tenant:
+                _LOG.warning(f'Tenant with name {tenant_name} not found!')
+                continue
+            col = sc_provider.get_for_tenant(tenant, end)
+            if col is None:
+                _LOG.warning(
+                    f'Cannot get shards collection for '
+                    f'{tenant.name} for {end}'
+                )
+                continue
+            if tenant.cloud == Cloud.AWS:
+                mapping = self._rs.group_parts_iterator_by_location(
+                    self._rs.iter_successful_parts(col)
+                )
+            else:
+                mapping = {
+                    GLOBAL_REGION: list(self._rs.iter_successful_parts(col))
+                }
+
+            region_coverages = {}
+            for location, parts in mapping.items():
+                region_coverages[location] = self._rs.calculate_coverages(
+                    successful=self._rs.get_standard_to_controls_to_rules(
+                        it=parts, metadata=ctx.metadata
+                    ),
+                    full=ctx.metadata.domain(tenant.cloud).full_cov,
+                )
+
+            # calculating total across whole account. For all except AWS those
+            # are the same
+            total = self._rs.calculate_coverages(
+                successful=self._rs.get_standard_to_controls_to_rules(
+                    it=self._rs.iter_successful_parts(col),
+                    metadata=ctx.metadata,
+                ),
+                full=ctx.metadata.domain(tenant.cloud).full_cov,
+            )
+            data = {
+                'id': tenant.project,
+                'last_scan_date': js.subset(tenant=tenant.name).last_scan_date,
+                'activated_regions': sorted(
+                    modular_helpers.get_tenant_regions(tenant)
+                ),
+                'data': {
+                    'regions': {
+                        location: {
+                            st.full_name: cov for st, cov in standards.items()
+                        }
+                        for location, standards in region_coverages.items()
+                    },
+                    'total': {st.full_name: cov for st, cov in total.items()},
+                },
+            }
+            yield self._rms.create(
+                key=self._rms.key_for_tenant(report_type, tenant),
+                data=data,
+                end=end,
+                start=start,
+            )
+
+    def operational_attacks(
+            self,
+            ctx: MetricsContext,
+            job_source: JobMetricsDataSource,
+            sc_provider: ShardsCollectionProvider,
+            report_type: ReportType,
+    ) -> ReportsGen:
+        start = report_type.start(ctx.now)
+        end = report_type.end(ctx.now)
+        js = job_source.subset(start=start, end=end, affiliation='tenant')
+        for tenant_name in js.scanned_tenants:
+            tenant = self._get_tenant(tenant_name)
+            if not tenant:
+                _LOG.warning(f'Tenant with name {tenant_name} not found!')
+                continue
+            col = sc_provider.get_for_tenant(tenant, end)
+            if col is None:
+                _LOG.warning(
+                    f'Cannot get shards collection for '
+                    f'{tenant.name} for {end}'
+                )
+                continue
+            data = json_round_trip(
+                ShardsCollectionDataSource(col, ctx.metadata).operational_attacks()
+            )
+
+            data = {
+                'id': tenant.project,
+                'last_scan_date': js.subset(tenant=tenant.name).last_scan_date,
+                'activated_regions': sorted(
+                    modular_helpers.get_tenant_regions(tenant)
+                ),
+                'data': data,
+            }
+            yield self._rms.create(
+                key=self._rms.key_for_tenant(report_type, tenant),
+                data=data,
+                end=end,
+                start=start,
+            )
+
+    def operational_k8s(self, ctx: MetricsContext, job_source: JobMetricsDataSource,
+                        sc_provider: ShardsCollectionProvider,
+                        report_type: ReportType) -> ReportsGen:
+        start = report_type.start(ctx.now)
+        end = report_type.end(ctx.now)
+        js = job_source.subset(start=start, end=end, affiliation='platform')
+        for platform_id in js.scanned_platforms:
+            platform = self._get_platform(platform_id)
+            if not platform:
+                _LOG.warning(f'Platform with id {platform_id} not found!')
+                continue
+            # TODO: finish
+            # col = sc_provider.get_for_tenant(tenant, end)
+            # if col is None:
+            #     _LOG.warning(
+            #         f'Cannot get shards collection for '
+            #         f'{tenant.name} for {end}'
+            #     )
+            #     continue
+
     def c_level_overview(
         self,
         ctx: MetricsContext,
@@ -511,7 +701,7 @@ class MetricsCollector:
     ) -> ReportsGen:
         start = report_type.start(ctx.now)
         end = report_type.end(ctx.now)
-        js = job_source.subset(start=start, end=end)
+        js = job_source.subset(start=start, end=end, affiliation='tenant')
         cloud_tenant = {
             Cloud.AWS.value: [],
             Cloud.AZURE.value: [],
