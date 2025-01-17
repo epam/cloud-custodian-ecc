@@ -1036,7 +1036,6 @@ class ReportType(str, Enum):
             hour=0, minute=0, second=0, microsecond=0, weekday=SU(-1)
         ),
     )
-
     OPERATIONAL_COMPLIANCE = (
         'OPERATIONAL_COMPLIANCE',
         'Compliance per tenant as of date of generation',
@@ -1044,6 +1043,14 @@ class ReportType(str, Enum):
     OPERATIONAL_FINOPS = (
         'OPERATIONAL_FINOPS',
         'Finops report per tenant as of date of generation',
+    )
+    OPERATIONAL_ATTACKS = (
+        'OPERATIONAL_ATTACKS',
+        'MITRE Attacks report per tenant as of date of generation'
+    )
+    OPERATIONAL_KUBERNETES = (
+        'OPERATIONAL_KUBERNETES',
+        'Just old K8S report as of date of generation. It contains both MITRE and Resources data'
     )
 
     # C-Level, kind of for the whole customer
@@ -1067,6 +1074,3 @@ class ReportType(str, Enum):
 
 class RabbitCommand(str, Enum):
     SEND_MAIL = 'SEND_MAIL'
-
-
-DEFAULT_COMPONENT_NAME = 'custodian-as-a-service'
